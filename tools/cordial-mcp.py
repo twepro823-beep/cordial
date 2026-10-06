@@ -259,7 +259,8 @@ TOOLS = [
     {
         "name": "cordial_info",
         "description": (
-            "Live counters: presents, commands accepted, swapchain extent, pid. The present "
+            "Live counters: presents, commands accepted, touch phases consumed by the pump, "
+            "swapchain extent, pid. The present "
             "count is the one that separates a frozen client from a slow one -- a wedged "
             "engine leaves it fixed while everything else keeps running. Call it twice a few "
             "seconds apart and compare."
@@ -289,6 +290,30 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
+        "name": "cordial_pointerlock",
+        "description": (
+            "Read the pointer-lock decision and result separately. Wayland reports the "
+            "target/current surfaces and compositor confirmation; X11 reports mode=xi2|warp "
+            "and the fallback reason. Both include the engine request and held buttons. A "
+            "confirmed lock with no camera motion points at Cordial's routing."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "cordial_fullscreen",
+        "description": (
+            "Enter or leave fullscreen through the active window backend. The change is "
+            "queued on Cordial's pump; follow with cordial_info twice and a screenshot to "
+            "verify that the extent changed and presents continue rather than treating the "
+            "accepted command as proof."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"enabled": {"type": "boolean"}},
+            "required": ["enabled"],
+        },
+    },
+    {
         "name": "cordial_loopers",
         "description": (
             "Every ALooper in the process: which thread owns it, how many descriptors it "
@@ -315,6 +340,25 @@ TOOLS = [
                 "button": {"type": "integer", "description": "Android button constant; 1 is primary. Default 1."},
             },
             "required": ["x", "y"],
+        },
+    },
+    {
+        "name": "cordial_touch",
+        "description": (
+            "Drive one touchscreen contact through Cordial's real touch tracker. "
+            "Use begin, zero or more update calls, then end; cancel clears every "
+            "active contact. Contact ids remain stable across calls, so two ids "
+            "exercise Android pointer-index packing and multi-touch."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["begin", "update", "end", "cancel"]},
+                "id": {"type": "integer", "description": "Contact id; required except for cancel."},
+                "x": {"type": "number", "description": "Surface x; required for begin/update."},
+                "y": {"type": "number", "description": "Surface y; required for begin/update."},
+            },
+            "required": ["action"],
         },
     },
     {
@@ -474,10 +518,39 @@ def tool_textbox(c, args):
     return [{"type": "text", "text": c.send("textbox")}]
 
 
+def tool_pointerlock(c, args):
+    return [{"type": "text", "text": c.send("pointerlock")}]
+
+
+def tool_fullscreen(c, args):
+    enabled = bool(args["enabled"])
+    reply = c.send("fullscreen" if enabled else "windowed")
+    return [{"type": "text", "text": f"{reply} enabled={str(enabled).lower()}"}]
+
+
 def tool_click(c, args):
     b = int(args.get("button", 1))
     c.send(f"click {float(args['x'])} {float(args['y'])} {b}")
     return [{"type": "text", "text": f"clicked ({args['x']}, {args['y']}) button {b}"}]
+
+
+def tool_touch(c, args):
+    action = args["action"]
+    if action not in ("begin", "update", "end", "cancel"):
+        raise ValueError("action must be begin, update, end or cancel")
+    if action == "cancel":
+        reply = c.send("touch cancel")
+        return [{"type": "text", "text": reply}]
+    if "id" not in args:
+        raise ValueError(f"id is required for touch {action}")
+    contact = int(args["id"])
+    if action in ("begin", "update"):
+        if "x" not in args or "y" not in args:
+            raise ValueError(f"x and y are required for touch {action}")
+        reply = c.send(f"touch {action} {contact} {float(args['x'])} {float(args['y'])}")
+    else:
+        reply = c.send(f"touch end {contact}")
+    return [{"type": "text", "text": reply}]
 
 
 def tool_move(c, args):
@@ -687,8 +760,11 @@ HANDLERS = {
     "cordial_screenshot": tool_screenshot,
     "cordial_info": tool_info,
     "cordial_textbox": tool_textbox,
+    "cordial_pointerlock": tool_pointerlock,
+    "cordial_fullscreen": tool_fullscreen,
     "cordial_loopers": tool_loopers,
     "cordial_click": tool_click,
+    "cordial_touch": tool_touch,
     "cordial_move": tool_move,
     "cordial_key": tool_key,
     "cordial_text": tool_text,

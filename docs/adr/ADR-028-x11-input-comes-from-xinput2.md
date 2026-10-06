@@ -132,6 +132,34 @@ preceded it and should land on its own terms. The warp and its
 taken when `XIQueryVersion` refuses. What XI2 changes is which path is default,
 not whether the other one exists.
 
+## Implemented pointer-motion slice (2026-10-05)
+
+`window.rs` now opens `libXi.so.6` late, negotiates XI 2.0, selects
+`XI_RawMotion` on the root window and reads its cookie only between
+`XGetEventData` and `XFreeEventData`. While Cordial owns the pointer grab, the
+camera consumes `raw_values`; core `MotionNotify` is discarded so the same
+physical motion is never delivered twice. Outside the lock raw events are
+ignored completely. A refused negotiation leaves the existing grab/warp/echo
+filter active.
+
+The `pointerlock` development-control report names `backend=x11` and
+`mode=xi2|warp`, along with the request, confirmed grab, engine answer, held
+buttons and fallback reason. This makes the degradation path observable rather
+than something inferred from a trace line. `CORDIAL_NO_XI2=1` forces the warp
+branch so the fallback can be exercised on the same server and build.
+
+Focus loss now releases every held mouse button as well as every held key. XI2
+raw events are global to the root window, so this is part of the privacy and
+stuck-input boundary rather than optional cleanup.
+
+This implements the pointer-motion part of the decision. Scroll still uses core
+buttons 4–7 and X11 touch is still not selected; the XI 2.1/2.2 bullets above
+remain future work and must not be read as current behaviour. The unit test for
+the packed valuator decoder covers missing X, missing Y, unrelated axes and a
+truncated value array. Live X11 acceptance still requires ten drags, first
+person, shift lock, Escape and focus loss on an X server, with the report
+showing `mode=xi2`; until that run, the #41 result remains `INFERRED`.
+
 ## What would change this
 
 A measurement showing `raw_values` is not in fact pre-acceleration on some

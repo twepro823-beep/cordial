@@ -51,6 +51,13 @@ use std::sync::{Mutex, OnceLock};
 pub enum Cmd {
     Move { x: f32, y: f32 },
     Button { x: f32, y: f32, down: bool, button: i32 },
+    /// One phase of a synthetic touchscreen contact.
+    ///
+    /// Unlike `click` with `CORDIAL_INPUT_TOUCH=1`, this keeps the contact
+    /// alive between commands, can name more than one contact and can exercise
+    /// cancellation. That is the minimum control surface issue #36 needs: a
+    /// tap alone cannot distinguish a bad move, pointer index or cancel path.
+    Touch { phase: TouchPhase, id: i64, x: f32, y: f32 },
     Key { down: bool, evdev: i32, modifiers: i32 },
     Text(String),
     Scroll { x: f32, y: f32, detents: f32 },
@@ -86,11 +93,23 @@ pub enum Cmd {
     UpdateSurface { app: bool, game: bool },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TouchPhase {
+    Begin,
+    Update,
+    End,
+    Cancel,
+}
+
 static QUEUE: Mutex<Vec<Cmd>> = Mutex::new(Vec::new());
 
 /// Commands accepted since start, so `info` can show the surface is live even
 /// when the thing being driven is not.
 static ACCEPTED: AtomicU64 = AtomicU64::new(0);
+/// Touch phases consumed by the engine pump, distinct from phases merely
+/// accepted by the socket thread. The MCP E2E needs this boundary: a live
+/// control socket beside a wedged pump can still enqueue forever.
+static TOUCH_PHASES_APPLIED: AtomicU64 = AtomicU64::new(0);
 
 fn push(c: Cmd) {
     if let Ok(mut q) = QUEUE.lock() {
@@ -198,7 +217,7 @@ fn handle(line: &str) -> String {
         // answer *before* the right-drag latch is applied to it. See
         // `wayland::pointer_lock_report` for why reading a trace line instead
         // was not a measurement.
-        "pointerlock" => crate::android::wayland::pointer_lock_report(),
+        "pointerlock" => crate::android::pointer_lock_report(),
         // A test seam for the one input to the lock decision that cannot be
         // produced from outside a game. See `input::FAKE_ENGINE_LOCK` for what
         // a reading taken with it set does and does not establish.
@@ -360,6 +379,37 @@ fn handle(line: &str) -> String {
             }
             _ => format!("err {verb} <x> <y> [button]"),
         },
+        "touch" => {
+            let Some(phase) = it.next() else {
+                return "err touch <begin|update|end|cancel> [id] [x y]".into();
+            };
+            if phase == "cancel" {
+                push(Cmd::Touch { phase: TouchPhase::Cancel, id: 0, x: 0.0, y: 0.0 });
+                return "ok".into();
+            }
+            let Some(id) = it.next().and_then(|v| v.parse::<i64>().ok()) else {
+                return "err touch <begin|update|end> <id> [x y]".into();
+            };
+            match phase {
+                "begin" | "update" => match (num(it.next()), num(it.next())) {
+                    (Some(x), Some(y)) => {
+                        let phase = if phase == "begin" {
+                            TouchPhase::Begin
+                        } else {
+                            TouchPhase::Update
+                        };
+                        push(Cmd::Touch { phase, id, x, y });
+                        "ok".into()
+                    }
+                    _ => format!("err touch {phase} <id> <x> <y>"),
+                },
+                "end" => {
+                    push(Cmd::Touch { phase: TouchPhase::End, id, x: 0.0, y: 0.0 });
+                    "ok".into()
+                }
+                _ => "err touch <begin|update|end|cancel> [id] [x y]".into(),
+            }
+        }
         // Keys are evdev codes, matching `input::pass_key_event` and every
         // other caller in the tree. Naming them would mean a second keymap to
         // keep correct, and the one that already exists is the compositor's.
@@ -472,10 +522,11 @@ fn info_line() -> String {
         crate::android::glcount::QUEUE_PRESENT.load(Ordering::Relaxed);
     let (w, h) = crate::android::vulkan::last_extent();
     format!(
-        "ok presents={presents}{}{} accepted={} extent={w}x{h} pid={}",
+        "ok presents={presents}{}{} accepted={} touch_phases={} extent={w}x{h} pid={}",
         crate::android::frame_pacing::summary().map(|s| format!(" {s}")).unwrap_or_default(),
         xr_info(),
         ACCEPTED.load(Ordering::Relaxed),
+        TOUCH_PHASES_APPLIED.load(Ordering::Relaxed),
         std::process::id(),
     )
 }
@@ -639,6 +690,25 @@ pub fn apply_queued(handle: i64) {
             Cmd::Button { x, y, down, button } => {
                 crate::android::input::script_button(handle, x, y, down, button, now_ms())
             }
+            Cmd::Touch { phase, id, x, y } => {
+                let surface = crate::android::canvas_size();
+                let time = now_ms();
+                match phase {
+                    TouchPhase::Begin => {
+                        crate::android::input::touch_down(handle, id, x, y, surface, time)
+                    }
+                    TouchPhase::Update => {
+                        crate::android::input::touch_motion(handle, id, x, y, surface, time)
+                    }
+                    TouchPhase::End => {
+                        crate::android::input::touch_up(handle, id, surface, time)
+                    }
+                    TouchPhase::Cancel => {
+                        crate::android::input::touch_cancel(handle, surface, time)
+                    }
+                }
+                TOUCH_PHASES_APPLIED.fetch_add(1, Ordering::Relaxed);
+            }
             Cmd::Key { down, evdev, modifiers } => {
                 crate::android::input::pass_key_event(down, evdev, modifiers)
             }
@@ -726,6 +796,23 @@ mod tests {
         drain();
         let reply = handle("redrew");
         assert!(reply.starts_with("err"), "expected an error reply, got {reply:?}");
+        assert!(drain().is_empty());
+    }
+
+    #[test]
+    fn touch_verbs_keep_the_contact_id_and_reject_incomplete_coordinates() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        drain();
+        assert_eq!(handle("touch begin 17 12.5 30"), "ok");
+        assert_eq!(handle("touch update 17 13 31.5"), "ok");
+        assert_eq!(handle("touch end 17"), "ok");
+        assert_eq!(handle("touch cancel"), "ok");
+        let queued = drain();
+        assert!(matches!(queued[0], Cmd::Touch { phase: TouchPhase::Begin, id: 17, x: 12.5, y: 30.0 }));
+        assert!(matches!(queued[1], Cmd::Touch { phase: TouchPhase::Update, id: 17, x: 13.0, y: 31.5 }));
+        assert!(matches!(queued[2], Cmd::Touch { phase: TouchPhase::End, id: 17, .. }));
+        assert!(matches!(queued[3], Cmd::Touch { phase: TouchPhase::Cancel, .. }));
+        assert!(handle("touch begin 17 12.5").starts_with("err"));
         assert!(drain().is_empty());
     }
 }

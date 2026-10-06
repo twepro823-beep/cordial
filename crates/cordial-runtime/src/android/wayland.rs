@@ -3457,6 +3457,13 @@ const WHEEL_AXIS_STEP: f32 = 10.0;
 /// `hide_pointer` fired for it.
 static POINTER_ON_CANVAS: AtomicBool = AtomicBool::new(false);
 
+/// Whether this seat's pointer focus is on GTK's toplevel.
+///
+/// A confirmed toplevel constraint may legitimately move focus here. This is
+/// kept separate from `POINTER_ON_CANVAS`: ordinary motion over the header bar
+/// is GTK's and must never be forwarded to the engine.
+static POINTER_ON_PARENT: AtomicBool = AtomicBool::new(false);
+
 /// Whether a web-view dialog of Cordial's own is in front of the engine.
 ///
 /// **Stacking and input focus are decided separately, and only stacking was
@@ -3518,7 +3525,11 @@ unsafe extern "C" fn pointer_enter(
 ) {
     let Some(w) = current() else { return };
     let ours = std::ptr::eq(surface, w.surface);
+    let live = w.host.0.wl_surface();
+    let parent = std::ptr::eq(surface, w.parent_surface)
+        || live.is_some_and(|s| std::ptr::eq(surface, s));
     POINTER_ON_CANVAS.store(ours, Ordering::Release);
+    POINTER_ON_PARENT.store(parent, Ordering::Release);
     if !ours {
         return;
     }
@@ -3585,6 +3596,7 @@ unsafe extern "C" fn pointer_leave(_data: *mut c_void, _pointer: *mut c_void, _s
         w.release_held_buttons();
     }
     POINTER_ON_CANVAS.store(false, Ordering::Release);
+    POINTER_ON_PARENT.store(false, Ordering::Release);
     super::input::reset_mouse_delta();
     super::input::forget_pending_unlocked_delta();
 }
@@ -3960,22 +3972,22 @@ static RIGHT_DRAG_LATCH_SINCE: AtomicI64 = AtomicI64::new(0);
 /// where that is decided and tested.
 static ENGINE_OWNS_LOCK: AtomicBool = AtomicBool::new(false);
 
-/// Whether this tick's lock is the engine's to recentre. `toplevel_lock` is
-/// `constrain_toplevel()`: false everywhere but KWin unless
-/// `CORDIAL_POINTER_LOCK_SURFACE` says otherwise.
+/// Whether this tick's lock is the engine's to recentre. `recentre_lock` is
+/// true only on KWin; Hyprland also constrains the toplevel for issue #56, but
+/// has no measurement supporting KWin's repeated recentring and release hint.
 ///
 /// A right-button drag Cordial started itself is not the engine's, and
 /// recentring under it would snap the camera to the middle of the canvas every
 /// tick -- unless the engine had the lock before the drag or shift went down
 /// during it, in which case the engine does own it.
 fn engine_owns_lock(
-    toplevel_lock: bool,
+    recentre_lock: bool,
     engine_wants: bool,
     dragging: bool,
     wanted_before_drag: bool,
     shift_during_drag: bool,
 ) -> bool {
-    toplevel_lock && engine_wants && (!dragging || wanted_before_drag || shift_during_drag)
+    recentre_lock && engine_wants && (!dragging || wanted_before_drag || shift_during_drag)
 }
 
 /// Whether releasing the lock sends an extra `wl_surface.commit` on the parent
@@ -4064,7 +4076,7 @@ unsafe extern "C" fn locked_pointer_locked(_data: *mut c_void, _lp: *mut c_void)
     // be drained by.
     super::input::reset_mouse_delta();
     super::input::forget_pending_unlocked_delta();
-    if ENGINE_OWNS_LOCK.load(Ordering::Acquire) && WaylandWindow::constrain_toplevel() {
+    if ENGINE_OWNS_LOCK.load(Ordering::Acquire) && WaylandWindow::recentre_engine_lock() {
         if let Some(w) = current() {
             let (cx, cy) = w.canvas_centre();
             w.set_pointer_position(cx, cy);
@@ -4110,13 +4122,21 @@ unsafe extern "C" fn relative_pointer_motion(
     dx_unaccel: i32,
     dy_unaccel: i32,
 ) {
-    // Relative motion arrives whenever the seat's pointer has focus, lock or no
-    // lock — this object is bound to the seat's one `wl_pointer`, not to a
-    // surface, so `POINTER_ON_CANVAS` is the same focus test `wl_pointer.motion`
-    // uses and is checked for the identical reason: nothing else here says
-    // whether the movement belongs to Cordial's canvas or another window
-    // entirely.
-    if !POINTER_ON_CANVAS.load(Ordering::Acquire) {
+    // Relative motion is bound to the seat's pointer, not to a surface. Most
+    // compositors leave focus on the canvas while locked. Hyprland's working
+    // constraint is the toplevel, and it moves focus there when confirming it;
+    // rejecting that surface produced issue #56's useful control: `locked`
+    // arrived, the real cursor stopped, and the camera received no motion.
+    //
+    // The parent is accepted only while a toplevel lock is confirmed. Without
+    // that conjunction this listener would forward motion over Cordial's own
+    // header bar, or worse after focus moved to another window.
+    let on_canvas = POINTER_ON_CANVAS.load(Ordering::Acquire);
+    let active = POINTER_LOCK_ACTIVE.load(Ordering::Acquire);
+    let on_locked_parent = active
+        && WaylandWindow::constrain_toplevel()
+        && POINTER_ON_PARENT.load(Ordering::Acquire);
+    if !on_canvas && !on_locked_parent {
         return;
     }
     let Some(w) = current() else { return };
@@ -4154,7 +4174,7 @@ unsafe extern "C" fn relative_pointer_motion(
     // which the compositor has already run through the desktop's pointer
     // profile (acceleration, "mouse speed"), and `dx_unaccel`/`dy_unaccel`,
     // which have not.
-    if POINTER_LOCK_ACTIVE.load(Ordering::Acquire) {
+    if active {
         // Locked: the camera. This used to send the accelerated pair
         // unconditionally, which is right for moving a UI cursor and wrong for
         // a camera: acceleration is superlinear in speed, so a fast sweep turns
@@ -4538,7 +4558,7 @@ impl WaylandWindow {
         let want = asked;
         if want {
             let owned = engine_owns_lock(
-                Self::constrain_toplevel(),
+                Self::recentre_engine_lock(),
                 engine_wants,
                 dragging,
                 LOCK_WANTED_BEFORE_RIGHT_DRAG.load(Ordering::Acquire),
@@ -4552,7 +4572,12 @@ impl WaylandWindow {
         }
 
         let held = !self.locked_pointer.lock().unwrap_or_else(|e| e.into_inner()).is_null();
-        let lockable_here = !Self::constrain_toplevel() || POINTER_ON_CANVAS.load(Ordering::Acquire);
+        let lockable_here = if Self::constrain_toplevel() {
+            POINTER_ON_PARENT.load(Ordering::Acquire)
+                || POINTER_ON_CANVAS.load(Ordering::Acquire)
+        } else {
+            POINTER_ON_CANVAS.load(Ordering::Acquire)
+        };
         if want && !held {
             if lockable_here {
                 self.lock_pointer();
@@ -4609,27 +4634,54 @@ impl WaylandWindow {
 
 /// Whether to constrain the GTK toplevel rather than the engine's subsurface.
 ///
-/// KWin only. KDE bug 463088 is why the toplevel is constrained at all, and the
-/// canvas being cut out of the toplevel's input region is why that was not
-/// enough -- see `lock_pointer`. On every other compositor the subsurface is the
-/// surface that actually holds pointer focus over the canvas, and constraining
-/// anything else is a lock that is granted and never activates.
+/// KWin and Hyprland. KDE bug 463088 is why KWin needs this target; issue #56's
+/// control established that Hyprland confirms the toplevel and never confirms
+/// the canvas. Other compositors keep the subsurface that actually holds
+/// pointer focus over the canvas.
 ///
-/// This is also the gate for everything the toplevel lock needed beyond the
-/// constraint itself: the canvas in the input region, recentring the engine's
-/// pointer while it holds the lock, and the hint commit on release.
+/// This also gates accepting relative motion while focus is on the parent and
+/// keeping the canvas in the parent's input region. KWin-only recentring and
+/// release hints use [`recentre_engine_lock`] instead; #56 supplied no evidence
+/// that Hyprland needs those workarounds.
 fn constrain_toplevel() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        match std::env::var("CORDIAL_POINTER_LOCK_SURFACE").as_deref() {
-            Ok("toplevel") => return true,
-            Ok("canvas") => return false,
-            _ => {}
-        }
         let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_ascii_lowercase();
         let session = std::env::var("XDG_SESSION_DESKTOP").unwrap_or_default().to_ascii_lowercase();
-        desktop.contains("kde") || desktop.contains("plasma")
-            || session.contains("kde") || session.contains("plasma")
+        let override_ = std::env::var("CORDIAL_POINTER_LOCK_SURFACE").ok();
+        Self::toplevel_lock_for(&desktop, &session, override_.as_deref())
+    })
+}
+
+/// Pure half of [`constrain_toplevel`], so the compositor rule and its two
+/// control values can be tested without process-global environment races.
+fn toplevel_lock_for(desktop: &str, session: &str, override_: Option<&str>) -> bool {
+    match override_ {
+        Some("toplevel") => return true,
+        Some("canvas") => return false,
+        _ => {}
+    }
+    [desktop, session].iter().any(|name| {
+        name.contains("kde") || name.contains("plasma") || name.contains("hyprland")
+    })
+}
+
+fn recentre_lock_for(desktop: &str, session: &str) -> bool {
+    [desktop, session]
+        .iter()
+        .any(|name| name.contains("kde") || name.contains("plasma"))
+}
+
+fn recentre_engine_lock() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let desktop = std::env::var("XDG_CURRENT_DESKTOP")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let session = std::env::var("XDG_SESSION_DESKTOP")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        Self::recentre_lock_for(&desktop, &session)
     })
 }
 
@@ -4733,7 +4785,8 @@ fn constrain_toplevel() -> bool {
         if slot.is_null() {
             return;
         }
-        let centre = ENGINE_OWNS_LOCK.swap(false, Ordering::AcqRel) && Self::constrain_toplevel();
+        let centre =
+            ENGINE_OWNS_LOCK.swap(false, Ordering::AcqRel) && Self::recentre_engine_lock();
         let (x, y) = if centre {
             let (cx, cy) = self.canvas_centre();
             self.set_pointer_position(cx, cy);
@@ -4814,10 +4867,18 @@ pub(crate) fn pointer_lock_report() -> String {
         None => "unavailable",
     };
     format!(
-        "ok requested={} confirmed={} focused={} engine={engine} \
+        "ok requested={} confirmed={} target={} pointer_surface={} focused={} engine={engine} \
          awaiting_drag_unlock={} shift_in_drag={} on_canvas={} buttons={}",
         POINTER_LOCK_REQUESTED.load(Ordering::Acquire),
         POINTER_LOCK_ACTIVE.load(Ordering::Acquire),
+        if WaylandWindow::constrain_toplevel() { "toplevel" } else { "canvas" },
+        if POINTER_ON_CANVAS.load(Ordering::Acquire) {
+            "canvas"
+        } else if POINTER_ON_PARENT.load(Ordering::Acquire) {
+            "toplevel"
+        } else {
+            "other"
+        },
         match current().and_then(|w| w.host.0.focused()) {
             Some(true) => "true",
             Some(false) => "false",
@@ -6686,9 +6747,8 @@ pub fn overrides() -> Vec<(&'static str, *mut c_void)> {
 mod tests {
     use super::*;
 
-    /// The recentring and the release hint are KWin's. Everything that is not
-    /// the toplevel-lock path must come out false whatever else is true, which
-    /// is the whole of "other compositors keep today's behaviour".
+    /// The recentring and the release hint are KWin's. Everything outside that
+    /// narrower path must come out false whatever else is true.
     #[test]
     fn the_engine_owns_the_lock_only_on_the_toplevel_path() {
         for engine_wants in [false, true] {
@@ -6713,6 +6773,21 @@ mod tests {
         assert!(!engine_owns_lock(true, true, true, false, false));
         assert!(engine_owns_lock(true, true, true, true, false));
         assert!(engine_owns_lock(true, true, true, false, true));
+    }
+
+    #[test]
+    fn hyprland_and_kwin_constrain_the_toplevel_but_mutter_keeps_the_canvas() {
+        assert!(WaylandWindow::toplevel_lock_for("kde", "plasma", None));
+        assert!(WaylandWindow::toplevel_lock_for("hyprland", "hyprland", None));
+        assert!(!WaylandWindow::toplevel_lock_for("gnome", "gnome", None));
+        assert!(WaylandWindow::toplevel_lock_for("gnome", "gnome", Some("toplevel")));
+        assert!(!WaylandWindow::toplevel_lock_for(
+            "hyprland",
+            "hyprland",
+            Some("canvas")
+        ));
+        assert!(WaylandWindow::recentre_lock_for("kde", "plasma"));
+        assert!(!WaylandWindow::recentre_lock_for("hyprland", "hyprland"));
     }
 
     #[test]

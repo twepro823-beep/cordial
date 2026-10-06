@@ -400,6 +400,13 @@ pub fn pump_input_events(handle: i64) {
     }
 }
 
+pub(crate) fn pointer_lock_report() -> String {
+    match backend() {
+        Backend::Wayland => wayland::pointer_lock_report(),
+        Backend::X11 => window::pointer_lock_report(),
+    }
+}
+
 /// Keep the window itself alive when there is no GameActivity to feed, as
 /// under `--app-bridge`. Wayland only: the X11 window has no toolkit loop of
 /// its own to starve.

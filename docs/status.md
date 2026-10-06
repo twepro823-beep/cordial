@@ -46,6 +46,7 @@ expecting rough edges. What changed release by release is on the
 | Web views (Marketplace, Profile, Communities) | Partly | They render in a signed-in WebKitGTK window and both observed bridge formats reach the engine. More pages need interactive coverage, and a page-specific bridge command can still use engine vocabulary Cordial has not seen |
 | Plugins | Partly | Host, broker and per-profile grants enforce every capability. Settings can grant or revoke one, and install or remove a plugin from a local `.tar.zst`. There is no in-app fetch from a remote index, so the marketplace half of the registry is unbuilt ([plugins](plugins.md)) |
 | Text entry coverage | Partly | The overlay needs testing across more field types and input methods |
+| Pointer-lock portability | Partly | Wayland reports requested/confirmed and target/focus surfaces; X11 now prefers XI2 raw motion and reports `mode=xi2\|warp`. Hyprland and real X11 acceptance runs are still pending, so #41/#56 remain `INFERRED` |
 | Frame rate | Unsettled | See below |
 
 ### Frame rate

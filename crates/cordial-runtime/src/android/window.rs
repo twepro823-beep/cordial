@@ -70,6 +70,11 @@ struct Xlib {
     connection_number: unsafe extern "C" fn(Display) -> c_int,
     pending: unsafe extern "C" fn(Display) -> c_int,
     next_event: unsafe extern "C" fn(Display, *mut c_void) -> c_int,
+    query_extension: unsafe extern "C" fn(
+        Display, *const c_char, *mut c_int, *mut c_int, *mut c_int,
+    ) -> c_int,
+    get_event_data: unsafe extern "C" fn(Display, *mut XGenericEventCookie) -> c_int,
+    free_event_data: unsafe extern "C" fn(Display, *mut XGenericEventCookie),
 
     grab_pointer: unsafe extern "C" fn(
         Display, Window, c_int, c_uint, c_int, c_int, Window, c_ulong, c_ulong,
@@ -160,6 +165,9 @@ impl Xlib {
             connection_number: sym!("XConnectionNumber"),
             pending: sym!("XPending"),
             next_event: sym!("XNextEvent"),
+            query_extension: sym!("XQueryExtension"),
+            get_event_data: sym!("XGetEventData"),
+            free_event_data: sym!("XFreeEventData"),
             grab_pointer: sym!("XGrabPointer"),
             ungrab_pointer: sym!("XUngrabPointer"),
             warp_pointer: sym!("XWarpPointer"),
@@ -170,6 +178,147 @@ impl Xlib {
             define_cursor: sym!("XDefineCursor"),
             free_pixmap: sym!("XFreePixmap"),
         })
+    }
+}
+
+/// The small part of XInput2 Cordial needs for relative mouse input. Like
+/// Xlib, libXi is optional and loaded late so a server without XI2 falls back
+/// to the existing core-X11 warp path instead of preventing startup.
+struct XInput2 {
+    opcode: c_int,
+}
+
+#[repr(C)]
+struct XIEventMask {
+    device_id: c_int,
+    mask_len: c_int,
+    mask: *mut u8,
+}
+
+#[repr(C)]
+struct XIValuatorState {
+    mask_len: c_int,
+    mask: *mut u8,
+    values: *mut f64,
+}
+
+#[repr(C)]
+struct XIRawEvent {
+    event_type: c_int,
+    serial: c_ulong,
+    send_event: c_int,
+    display: Display,
+    extension: c_int,
+    xi_event_type: c_int,
+    time: c_ulong,
+    device_id: c_int,
+    source_id: c_int,
+    detail: c_int,
+    flags: c_int,
+    valuators: XIValuatorState,
+    raw_values: *mut f64,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct XGenericEventCookie {
+    event_type: c_int,
+    serial: c_ulong,
+    send_event: c_int,
+    display: Display,
+    extension: c_int,
+    xi_event_type: c_int,
+    cookie: c_uint,
+    data: *mut c_void,
+}
+
+const GENERIC_EVENT: c_int = 35;
+const XI_ALL_MASTER_DEVICES: c_int = 1;
+const XI_RAW_MOTION: c_int = 17;
+
+/// Decode XI2's packed valuator array. Each set bit consumes one value; axes
+/// zero and one are the relative X/Y pair used by a master pointer.
+fn xi_raw_axes(mask: &[u8], values: &[f64]) -> Option<(f64, f64)> {
+    let mut value_index = 0;
+    let mut x = None;
+    let mut y = None;
+    for axis in 0..mask.len() * 8 {
+        if mask[axis / 8] & (1 << (axis % 8)) == 0 {
+            continue;
+        }
+        let value = *values.get(value_index)?;
+        value_index += 1;
+        match axis {
+            0 => x = Some(value),
+            1 => y = Some(value),
+            _ => {}
+        }
+    }
+    (x.is_some() || y.is_some()).then_some((x.unwrap_or(0.0), y.unwrap_or(0.0)))
+}
+
+impl XInput2 {
+    fn load(xlib: &Xlib, display: Display, root: Window) -> Result<Self, String> {
+        if std::env::var_os("CORDIAL_NO_XI2").is_some() {
+            return Err("disabled by CORDIAL_NO_XI2=1".into());
+        }
+        let lib = unsafe { dlopen(c"libXi.so.6".as_ptr(), RTLD_NOW) };
+        if lib.is_null() {
+            return Err("libXi.so.6 is not available".into());
+        }
+        macro_rules! xi_sym {
+            ($name:literal, $ty:ty) => {{
+                let name = CString::new($name).unwrap();
+                let symbol = unsafe { dlsym(lib, name.as_ptr()) };
+                if symbol.is_null() {
+                    return Err(format!("libXi has no {}", $name));
+                }
+                unsafe { std::mem::transmute::<*mut c_void, $ty>(symbol) }
+            }};
+        }
+        let query_version = xi_sym!(
+            "XIQueryVersion",
+            unsafe extern "C" fn(Display, *mut c_int, *mut c_int) -> c_int
+        );
+        let select_events = xi_sym!(
+            "XISelectEvents",
+            unsafe extern "C" fn(Display, Window, *mut XIEventMask, c_int) -> c_int
+        );
+
+        let mut opcode = 0;
+        let mut first_event = 0;
+        let mut first_error = 0;
+        let present = unsafe {
+            (xlib.query_extension)(
+                display,
+                c"XInputExtension".as_ptr(),
+                &mut opcode,
+                &mut first_event,
+                &mut first_error,
+            )
+        };
+        if present == 0 {
+            return Err("the X server does not advertise XInputExtension".into());
+        }
+
+        let mut major = 2;
+        let mut minor = 0;
+        if unsafe { query_version(display, &mut major, &mut minor) } != 0 {
+            return Err("the X server refused XInput 2.0".into());
+        }
+
+        let mut bits = [0u8; 3];
+        bits[(XI_RAW_MOTION / 8) as usize] |= 1 << (XI_RAW_MOTION % 8);
+        let mut mask = XIEventMask {
+            device_id: XI_ALL_MASTER_DEVICES,
+            mask_len: bits.len() as c_int,
+            mask: bits.as_mut_ptr(),
+        };
+        if unsafe { select_events(display, root, &mut mask, 1) } != 0 {
+            return Err("XISelectEvents(XI_RawMotion) failed".into());
+        }
+        unsafe { (xlib.flush)(display) };
+        Ok(Self { opcode })
     }
 }
 
@@ -187,6 +336,7 @@ pub struct HostWindow {
     /// the event pump can recognise one without a round trip to the server.
     wm_protocols: c_ulong,
     wm_delete_window: c_ulong,
+    xi2: Option<XInput2>,
     /// Dimensions the engine asked for via `ANativeWindow_setBuffersGeometry`,
     /// which override the window's own size in every query. Android reports the
     /// buffer geometry, not the surface geometry, and the engine sizes its
@@ -211,6 +361,7 @@ struct InputState {
     /// Keys the engine has been told are down and not yet told are up, as
     /// (Android keycode, X keycode). See the `FOCUS_OUT` arm.
     held_keys: Vec<(i32, i32)>,
+    last_pointer: (f32, f32),
 }
 
 /// Record that `key` went down or up, so a focus loss can release whatever is
@@ -227,11 +378,8 @@ fn track_held_key(held: &mut Vec<(i32, i32)>, down: bool, key: (i32, i32)) {
     }
 }
 
-/// X11 pointer capture state.
-///
-/// X11 has no Wayland relative-pointer protocol in this backend, so the first
-/// implementation uses XGrabPointer + XWarpPointer and derives dx/dy from
-/// MotionNotify events around a fixed centre.
+/// X11 pointer capture state. XI2 supplies relative deltas when available;
+/// the warp fields remain the core-X11 fallback for old or restricted servers.
 struct PointerLockState {
     locked: bool,
     suppressed: bool,
@@ -662,6 +810,18 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
         (w, (xlib.connection_number)(display), wm_protocols, wm_delete_window)
     };
 
+    let root = unsafe { (xlib.default_root_window)(display) };
+    let xi2 = match XInput2::load(&xlib, display, root) {
+        Ok(xi2) => {
+            eprintln!("[cordial] X11 pointer motion: XI2 raw input");
+            Some(xi2)
+        }
+        Err(reason) => {
+            eprintln!("[cordial] X11 pointer motion: core warp fallback ({reason})");
+            None
+        }
+    };
+
     let host = HostWindow {
         xlib,
         display,
@@ -669,6 +829,7 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
         conn_fd,
         wm_protocols,
         wm_delete_window,
+        xi2,
         buffers: Mutex::new(Geometry {
             width: width as i32,
             height: height as i32,
@@ -679,14 +840,15 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
             down_time_ms: 0,
             clock: std::time::Instant::now(),
             held_keys: Vec::new(),
+            last_pointer: (width as f32 / 2.0, height as f32 / 2.0),
         }),
         pointer_lock: Mutex::new(PointerLockState::new()),
         fullscreen: AtomicBool::new(place.fullscreen),
     };
     // No touchscreen, and that is a statement about this backend rather than
-    // about the machine: X11 core input has no touch at all, XInput2's is a
-    // separate extension nothing here binds, and so a touchscreen on this host
-    // could not reach Cordial through this path however present it is. Saying
+    // about the machine: this XInput2 binding selects only raw pointer motion,
+    // not XI_Touch events, so a touchscreen on this host could not reach
+    // Cordial through this path however present it is. Saying
     // false is therefore true of what the client can actually receive, which is
     // what `isTouchDevice` is for. A user on a touchscreen who wants the mobile
     // interface on X11 has `CORDIAL_INPUT_TOUCH=1`, which overrides this.
@@ -905,8 +1067,9 @@ impl HostWindow {
     /// core request recovers what the device actually sent, so the warp
     /// cannot be the default but stays as the only thing that works when XI2
     /// is not there to ask. Landing XI2 is sequenced after this change, not
-    /// inside it — see ADR-028's "Sequencing" — so `pointer_lock_decision`
-    /// and `locked_pointer_delta` above are not where that work belongs.
+    /// inside it. XI2 is now the default; `pointer_lock_decision` remains
+    /// shared by both branches and `locked_pointer_delta` belongs only to the
+    /// fallback.
     fn sync_pointer_lock(&self) {
         let engine_wants = super::input::engine_wants_pointer_lock() == Some(true);
 
@@ -950,8 +1113,8 @@ impl HostWindow {
         }
 
         let centre = (width / 2, height / 2);
-        let root =
-            unsafe { (self.xlib.default_root_window)(self.display) };
+        let warp_fallback = self.xi2.is_none();
+        let root = unsafe { (self.xlib.default_root_window)(self.display) };
 
         let mut root_return = 0;
         let mut child_return = 0;
@@ -961,22 +1124,24 @@ impl HostWindow {
         let mut win_y = 0;
         let mut mask = 0;
 
-        let queried = unsafe {
-            (self.xlib.query_pointer)(
-                self.display,
-                root,
-                &mut root_return,
-                &mut child_return,
-                &mut root_x,
-                &mut root_y,
-                &mut win_x,
-                &mut win_y,
-                &mut mask,
-            )
+        let saved_root = if warp_fallback {
+            let queried = unsafe {
+                (self.xlib.query_pointer)(
+                    self.display,
+                    root,
+                    &mut root_return,
+                    &mut child_return,
+                    &mut root_x,
+                    &mut root_y,
+                    &mut win_x,
+                    &mut win_y,
+                    &mut mask,
+                )
+            };
+            (queried != 0).then_some((root_x, root_y))
+        } else {
+            None
         };
-
-        let saved_root =
-            if queried != 0 { Some((root_x, root_y)) } else { None };
 
         // X11 CurrentTime is 0.
         // owner_events = True
@@ -1014,24 +1179,26 @@ impl HostWindow {
                 .unwrap_or_else(|e| e.into_inner());
 
             state.locked = true;
-            state.ignore_next_warp = true;
+            state.ignore_next_warp = warp_fallback;
             state.centre = centre;
             state.saved_root = saved_root;
         }
 
-        unsafe {
-            (self.xlib.warp_pointer)(
-                self.display,
-                0,
-                self.window,
-                0,
-                0,
-                0,
-                0,
-                centre.0,
-                centre.1,
-            );
-            (self.xlib.flush)(self.display);
+        if warp_fallback {
+            unsafe {
+                (self.xlib.warp_pointer)(
+                    self.display,
+                    0,
+                    self.window,
+                    0,
+                    0,
+                    0,
+                    0,
+                    centre.0,
+                    centre.1,
+                );
+                (self.xlib.flush)(self.display);
+            }
         }
 
         super::input::reset_mouse_delta();
@@ -1048,9 +1215,10 @@ impl HostWindow {
 
         if super::input::trace_mouse() {
             eprintln!(
-                "[cordial] X11 pointer lock acquired at ({}, {})",
+                "[cordial] X11 pointer lock acquired at ({}, {}) via {}",
                 centre.0,
-                centre.1
+                centre.1,
+                if warp_fallback { "core warp" } else { "XI2 raw motion" }
             );
         }
     }
@@ -1399,6 +1567,7 @@ impl HostWindow {
 
         let mut state = self.input.lock().unwrap_or_else(|e| e.into_inner());
         let now = state.clock.elapsed().as_millis() as i64;
+        state.last_pointer = (x, y);
 
         if press {
             if state.buttons == 0 {
@@ -1435,6 +1604,12 @@ impl HostWindow {
                 .unwrap_or_else(|e| e.into_inner());
 
             if state.locked {
+                // XI_RawMotion is the sole relative source in XI2 mode. Core
+                // MotionNotify may still be generated by the grab and must not
+                // be delivered as a second, accelerated camera delta.
+                if self.xi2.is_some() {
+                    return;
+                }
                 let centre = state.centre;
 
                 let (dx, dy) = match locked_pointer_delta(
@@ -1479,11 +1654,12 @@ impl HostWindow {
                 // pointer is captured. The absolute position remains the
                 // capture centre, but Roblox still sees the same MotionEvent
                 // sequence it saw before pointer locking was introduced.
-                let input = self
+                let mut input = self
                     .input
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
 
+                input.last_pointer = (cx as f32, cy as f32);
                 let buttons = input.buttons;
                 let down_time = input.down_time_ms;
                 let now = input.clock.elapsed().as_millis() as i64;
@@ -1559,7 +1735,9 @@ impl HostWindow {
             .input
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let mut state = state;
         let now = state.clock.elapsed().as_millis() as i64;
+        state.last_pointer = (x, y);
         let (buttons, down_time) = (state.buttons, state.down_time_ms);
         drop(state);
         // A held button makes this a drag — part of the gesture the DOWN
@@ -1572,6 +1750,55 @@ impl HostWindow {
         // real and the engine consumes it, it is simply not what hit-tests the
         // Lua UI.
         pass_mouse_move(x, y);
+    }
+
+    fn dispatch_raw_motion(&self, handle: i64, raw: &XIRawEvent) {
+        let (locked, centre) = {
+            let state = self.pointer_lock.lock().unwrap_or_else(|e| e.into_inner());
+            (state.locked, state.centre)
+        };
+        if !locked || raw.valuators.mask_len <= 0 || raw.valuators.mask.is_null() {
+            return;
+        }
+
+        let mask_len = raw.valuators.mask_len as usize;
+        let mask = unsafe { std::slice::from_raw_parts(raw.valuators.mask, mask_len) };
+        let value_count = mask.iter().map(|byte| byte.count_ones() as usize).sum();
+        if raw.raw_values.is_null() || value_count == 0 {
+            return;
+        }
+        let values = unsafe { std::slice::from_raw_parts(raw.raw_values, value_count) };
+        let Some((dx, dy)) = xi_raw_axes(mask, values) else {
+            return;
+        };
+
+        let (buttons, down_time, now) = {
+            let mut input = self.input.lock().unwrap_or_else(|e| e.into_inner());
+            input.last_pointer = (centre.0 as f32, centre.1 as f32);
+            (input.buttons, input.down_time_ms, input.clock.elapsed().as_millis() as i64)
+        };
+        let action = if buttons != 0 { ACTION_MOVE } else { ACTION_HOVER_MOVE };
+        deliver_mouse(
+            handle,
+            action,
+            centre.0 as f32,
+            centre.1 as f32,
+            buttons,
+            0,
+            now,
+            down_time,
+        );
+        if dx != 0.0 || dy != 0.0 {
+            if super::input::trace_mouse() {
+                eprintln!("[cordial] X11 XI2 raw delta ({dx:.3}, {dy:.3})");
+            }
+            super::input::pass_mouse_move_delta(
+                centre.0 as f32,
+                centre.1 as f32,
+                dx as f32,
+                dy as f32,
+            );
+        }
     }
 
     fn dispatch_key(&self, handle: i64, buf: &mut [u8; 256], down: bool) {
@@ -1762,11 +1989,55 @@ impl HostWindow {
                 FOCUS_OUT => {
                     self.release_pointer_lock();
 
-                    let stranded = {
+                    let (stranded_keys, stranded_buttons, down_time, pointer) = {
                         let mut state = self.input.lock().unwrap_or_else(|e| e.into_inner());
+                        let buttons = state.buttons;
                         state.buttons = 0;
-                        std::mem::take(&mut state.held_keys)
+                        (
+                            std::mem::take(&mut state.held_keys),
+                            buttons,
+                            state.down_time_ms,
+                            state.last_pointer,
+                        )
                     };
+
+                    if stranded_buttons != 0 {
+                        let now = self.now_ms();
+                        let mut remaining = stranded_buttons;
+                        for button in [
+                            super::input::BUTTON_PRIMARY,
+                            super::input::BUTTON_SECONDARY,
+                            super::input::BUTTON_TERTIARY,
+                            super::input::BUTTON_BACK,
+                            super::input::BUTTON_FORWARD,
+                        ] {
+                            if stranded_buttons & button == 0 {
+                                continue;
+                            }
+                            remaining &= !button;
+                            deliver_mouse(
+                                handle,
+                                ACTION_BUTTON_RELEASE,
+                                pointer.0,
+                                pointer.1,
+                                remaining,
+                                button,
+                                now,
+                                down_time,
+                            );
+                            pass_mouse_button(pointer.0, pointer.1, false, button);
+                        }
+                        deliver_mouse(
+                            handle,
+                            ACTION_UP,
+                            pointer.0,
+                            pointer.1,
+                            0,
+                            0,
+                            now,
+                            down_time,
+                        );
+                    }
 
                     // **Let go of every key the engine still thinks is down.**
                     // X only sends key events to the focused client, so a key
@@ -1782,9 +2053,9 @@ impl HostWindow {
                     // whole of #41's second symptom -- no X11 session was run
                     // here -- but a release for a key that is up is harmless,
                     // and a missing one is the reported bug's shape.
-                    if !stranded.is_empty() {
+                    if !stranded_keys.is_empty() {
                         let now = self.now_ms();
-                        for (keycode, x_keycode) in stranded {
+                        for (keycode, x_keycode) in stranded_keys {
                             deliver_key(handle, false, keycode, x_keycode, 0, 0, 0, now, now);
                             pass_key_event(false, x_keycode - 8, 0);
                         }
@@ -1827,6 +2098,25 @@ impl HostWindow {
                         if !WINDOW_CLOSED.swap(true, Ordering::AcqRel) {
                             println!("[android] X11: the window manager asked the window to close");
                         }
+                    }
+                }
+                GENERIC_EVENT => {
+                    let Some(xi2) = self.xi2.as_ref() else {
+                        continue;
+                    };
+                    let mut cookie = unsafe {
+                        std::ptr::read_unaligned(buf.as_ptr() as *const XGenericEventCookie)
+                    };
+                    if cookie.extension != xi2.opcode || cookie.xi_event_type != XI_RAW_MOTION {
+                        continue;
+                    }
+                    let populated = unsafe { (self.xlib.get_event_data)(self.display, &mut cookie) };
+                    if populated != 0 {
+                        if !cookie.data.is_null() {
+                            let raw = unsafe { &*(cookie.data as *const XIRawEvent) };
+                            self.dispatch_raw_motion(handle, raw);
+                        }
+                        unsafe { (self.xlib.free_event_data)(self.display, &mut cookie) };
                     }
                 }
                 _ => {}
@@ -1908,6 +2198,50 @@ pub fn pump_input_events(handle: i64) {
     if let Some(w) = current() {
         w.pump_input_events(handle);
     }
+}
+
+pub(crate) fn pointer_lock_report() -> String {
+    let Some(window) = current() else {
+        return "ok backend=x11 requested=false confirmed=false mode=unopened reason=no-window"
+            .into();
+    };
+    let engine = super::input::engine_wants_pointer_lock();
+    let buttons = window.input.lock().unwrap_or_else(|e| e.into_inner()).buttons;
+    let state = window.pointer_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let disabled = std::env::var_os("CORDIAL_NO_POINTER_LOCK").is_some();
+    let force = std::env::var_os("CORDIAL_FORCE_POINTER_LOCK").is_some();
+    let no_drag = std::env::var_os("CORDIAL_NO_DRAG_LOCK").is_some();
+    let (requested, _) = pointer_lock_decision(
+        engine == Some(true),
+        buttons,
+        no_drag,
+        force,
+        state.suppressed,
+    );
+    let reason = if disabled {
+        "disabled"
+    } else if state.suppressed {
+        "escape-suppressed"
+    } else if state.locked {
+        "active"
+    } else if requested {
+        "awaiting-grab"
+    } else {
+        "not-requested"
+    };
+    format!(
+        "ok backend=x11 requested={} confirmed={} mode={} target=window focused=unknown \
+         engine={} buttons={} reason={reason}",
+        requested && !disabled,
+        state.locked,
+        if window.xi2.is_some() { "xi2" } else { "warp" },
+        match engine {
+            Some(true) => "true",
+            Some(false) => "false",
+            None => "unavailable",
+        },
+        buttons,
+    )
 }
 
 // ------------------------------------------------------- ANativeWindow_*
@@ -2158,6 +2492,31 @@ mod tests {
         assert_eq!(held, vec![(47, 39)], "only the key that came up is forgotten");
         track_held_key(&mut held, false, (99, 99)); // release for a key never seen
         assert_eq!(held, vec![(47, 39)]);
+    }
+
+    #[test]
+    fn xi2_raw_valuators_are_packed_by_the_set_mask_bits() {
+        assert_eq!(xi_raw_axes(&[0b0000_0011], &[2.5, -4.0]), Some((2.5, -4.0)));
+        assert_eq!(xi_raw_axes(&[0b0000_0010], &[7.0]), Some((0.0, 7.0)));
+        assert_eq!(xi_raw_axes(&[0b0000_0101], &[3.0, 99.0]), Some((3.0, 0.0)));
+        assert_eq!(xi_raw_axes(&[0], &[]), None);
+        assert_eq!(xi_raw_axes(&[0b11], &[1.0]), None, "truncated values are rejected");
+    }
+
+    #[test]
+    fn xi2_cookie_and_raw_event_match_the_system_header_layout() {
+        // Measured from Xlib.h/XInput2.h on x86-64. These are handwritten FFI
+        // structs, so an offset check is the guard against a field being added
+        // in the visually plausible but ABI-wrong place.
+        assert_eq!(std::mem::size_of::<XGenericEventCookie>(), 56);
+        assert_eq!(std::mem::offset_of!(XGenericEventCookie, extension), 32);
+        assert_eq!(std::mem::offset_of!(XGenericEventCookie, xi_event_type), 36);
+        assert_eq!(std::mem::offset_of!(XGenericEventCookie, data), 48);
+        assert_eq!(std::mem::size_of::<XIValuatorState>(), 24);
+        assert_eq!(std::mem::offset_of!(XIValuatorState, values), 16);
+        assert_eq!(std::mem::size_of::<XIRawEvent>(), 96);
+        assert_eq!(std::mem::offset_of!(XIRawEvent, valuators), 64);
+        assert_eq!(std::mem::offset_of!(XIRawEvent, raw_values), 88);
     }
 
     #[test]
