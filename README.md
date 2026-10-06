@@ -73,6 +73,10 @@ Servers list, and joining a private server (0.19.0). The reporter of
 | Camera-sensitivity text box glitches the client | [#53](https://github.com/luohoa97/cordial/issues/53) |
 | X11 camera snaps 180 degrees | [#41](https://github.com/luohoa97/cordial/issues/41) |
 
+The reproducible acceptance matrix and the distinction between measured and
+`INFERRED` results are in
+[the eight-issue validation runbook](docs/analysis/known-broken-validation.md).
+
 Controller buttons and sticks work; the brand of glyph Roblox draws may be
 wrong ([`docs/controllers.md`](docs/controllers.md)). No force feedback.
 

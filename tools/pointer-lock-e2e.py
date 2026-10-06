@@ -210,11 +210,11 @@ def main():
     args = ap.parse_args()
 
     os.makedirs(OUT, exist_ok=True)
-    binary = os.path.join(ROOT, "target/release/cordial-run")
-    lib = os.path.expanduser("~/.cache/cordial/lib/x86_64")
-    apk = os.path.expanduser(
+    binary = os.environ.get("CORDIAL_E2E_BINARY", os.path.join(ROOT, "target/release/cordial-run"))
+    lib = os.environ.get("CORDIAL_LIB_DIR", os.path.expanduser("~/.cache/cordial/lib/x86_64"))
+    apk = os.environ.get("CORDIAL_APK", os.path.expanduser(
         "~/.var/app/org.vinegarhq.Sober/data/sober/packages/x86_64/"
-        "com.roblox.client/base.apk")
+        "com.roblox.client/base.apk"))
     for path in (binary, lib, apk):
         if not os.path.exists(path):
             sys.exit(f"FAIL: missing {path}")
@@ -265,22 +265,24 @@ def main():
         print(f"== app ready: {ready}")
         time.sleep(10)
 
-        dev = Devctl(os.path.expanduser(
-            f"~/.local/share/cordial/profiles/{args.profile}/devctl.sock"))
+        data_home = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
+        dev = Devctl(os.path.join(
+            data_home, "cordial", "profiles", args.profile, "devctl.sock"))
         print(f"== {dev.send('info')}")
         run_cases(case, dev, kbd, ptr, args)
     finally:
-        for h in (kbd, ptr):
-            if h:
-                h.close()
-        if client and client.poll() is None:
-            client.terminate()
-            try:
-                client.wait(timeout=15)
-            except Exception:
-                client.kill()
-        if sway and not args.keep:
-            in_box(f"kill {sway}")
+        if not args.keep:
+            for h in (kbd, ptr):
+                if h:
+                    h.close()
+            if client and client.poll() is None:
+                client.terminate()
+                try:
+                    client.wait(timeout=15)
+                except Exception:
+                    client.kill()
+            if sway:
+                in_box(f"kill {sway}")
 
     bad = case.failed()
     print()

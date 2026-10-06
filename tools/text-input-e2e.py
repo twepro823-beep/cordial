@@ -34,7 +34,7 @@ that could not see a failure:
 Input is driven inside a nested compositor on its own `WAYLAND_DISPLAY`, which
 is the one form AGENTS.md permits -- never at the developer's session.
 
-Usage:  tools/text-input-e2e.py [--profile NAME] [--keep]
+Usage:  tools/text-input-e2e.py [--profile NAME] [--gtk-renderer auto|vulkan|cairo] [--keep]
 """
 
 import argparse, json, os, re, shutil, socket, subprocess, sys, time
@@ -250,6 +250,8 @@ def main():
                          "switching off the thing under test and showing the same assertions fail")
     ap.add_argument("--width", type=int, default=1280)
     ap.add_argument("--height", type=int, default=800)
+    ap.add_argument("--gtk-renderer", choices=("auto", "vulkan", "cairo"), default="auto",
+                    help="GTK renderer arm. Run once with vulkan and once with cairo for #53.")
     args = ap.parse_args()
 
     os.makedirs(OUT, exist_ok=True)
@@ -310,6 +312,10 @@ def main():
         for kv in args.client_env:
             k, _, v = kv.partition("=")
             env[k] = v
+        if args.gtk_renderer == "auto":
+            env.pop("GSK_RENDERER", None)
+        else:
+            env["GSK_RENDERER"] = args.gtk_renderer
         log = open(log_path, "w")
         client = subprocess.Popen(
             [binary, "--lib-dir", lib, "--apk", apk, "--host-libc",
@@ -894,6 +900,75 @@ def run_cases(case, dev, kbd, ptr, log_path, args, display):
         type_("second")
         s = state()
         case.check("typing works after a refocus", s["text"], "second")
+
+    print("\n-- 12a. fullscreen keeps the editor focused, visible and editable")
+    if box2["focus"] != "none":
+        def info():
+            line = dev.send("info")
+            return {
+                "presents": int(re.search(r"presents=(\d+)", line).group(1)),
+                "extent": tuple(map(int, re.search(r"extent=(\d+)x(\d+)", line).groups())),
+                "raw": line,
+            }
+
+        def client_rect():
+            raw = in_box("SWAYSOCK=$(ls -t $XDG_RUNTIME_DIR/sway-ipc.*.sock | head -1) "
+                         "swaymsg -t get_tree -r").stdout
+            try:
+                tree = json.loads(raw)
+            except Exception:
+                return None
+            stack = [tree]
+            while stack:
+                node = stack.pop()
+                if node.get("pid") == client_pid:
+                    rect = node.get("rect") or {}
+                    return tuple(rect.get(k) for k in ("x", "y", "width", "height"))
+                stack.extend(node.get("nodes", []))
+                stack.extend(node.get("floating_nodes", []))
+            return None
+
+        # The nested session contains this one client. Its pid is read from the
+        # same devctl response used by the rest of the suite, not guessed with
+        # pgrep (which can select an unrelated profile).
+        client_pid = int(re.search(r"pid=(\d+)", dev.send("info")).group(1))
+        dev.send("fullscreen")
+        deadline = time.time() + 8
+        rect = None
+        while time.time() < deadline:
+            rect = client_rect()
+            if rect == (0, 0, args.width, args.height):
+                break
+            time.sleep(0.2)
+        case.check("the fullscreen toplevel exactly matches the output",
+                   rect, (0, 0, args.width, args.height))
+        full = dev.textbox()
+        case.check("the box keeps focus in fullscreen", full.get("focus") != "none", True)
+        case.check("the fullscreen editor still uses engine geometry",
+                   full.get("placed"), "engine")
+        key("ctrl+a")
+        type_("fullscreen")
+        typed = wait_for(dev, lambda b: b.get("text") == "fullscreen", timeout=4.0)
+        case.check("typing reaches the fullscreen box", typed.get("text"), "fullscreen")
+        first_full = info()
+        time.sleep(2)
+        second_full = info()
+        case.check("presents continue while the fullscreen editor is focused",
+                   second_full["presents"] > first_full["presents"], True)
+        renderer = args.gtk_renderer
+        compositor_shot = os.path.join(OUT, f"fullscreen-{renderer}-compositor.png")
+        swapchain_shot = os.path.join(OUT, f"fullscreen-{renderer}-swapchain.png")
+        in_box(f"WAYLAND_DISPLAY={display} grim {compositor_shot}")
+        dev.send(f"screenshot {swapchain_shot}")
+        case.note("fullscreen captures", f"{compositor_shot}, {swapchain_shot}")
+
+        dev.send("windowed")
+        time.sleep(2)
+        after_fs = info()
+        case.check("presents continue after leaving fullscreen",
+                   after_fs["presents"] > second_full["presents"], True)
+        case.check("the box keeps focus after leaving fullscreen",
+                   dev.textbox().get("focus") != "none", True)
 
     print("\n-- 12c. the editor follows the window when it resizes")
     # **The case docs/NEXT.md says was never tested.** `editor_rect` is in
