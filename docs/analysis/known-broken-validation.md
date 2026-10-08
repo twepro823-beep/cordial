@@ -22,7 +22,7 @@ nested compositor.
 | #38 missing window | GTK/Wayland lifecycle and present instrumentation already present | COSMIC, KWin and wlroots runs; capture CPU plus two stacks if it spins | `INFERRED` |
 | #39 fullscreen | live MCP fullscreen tool and ten-cycle runner | KDE/AMD and reporter's GNOME run | `INFERRED` |
 | #41 X11 camera jump | XI2 `XI_RawMotion` primary path, warp fallback, focus-loss releases | real X11: ten drags, first person, shift lock and focus loss | `INFERRED` |
-| #52 exit hang | bounded teardown watchdog and unit tests already present | workspace tests plus repeated real exits | awaiting local dependency |
+| #52 exit hang | bounded teardown watchdog; workspace and watchdog tests pass | repeated real exits with no surviving profile process | `INFERRED` |
 | #53 TextBox | renderer-specific fullscreen/resize arm and compositor captures | Vulkan and cairo locally, then reporter's Hyprland | `INFERRED` |
 | #56 Hyprland lock | toplevel target, confirmed-parent relative routing and expanded report | reporter's Hyprland run | `INFERRED` |
 
@@ -116,6 +116,30 @@ during the wait, and the bounded no-native-handle path. After those tests pass,
 run repeated real closes and assert that no profile-owned `cordial-run` remains.
 Exit 124 is an explicit watchdog diagnosis; an indefinite process is a failure.
 
-Only then remove #52 from `README.md`. This checkout could not reach those
-tests on 2026-10-05 because the host lacked `libadwaita-1.pc`; keeping the row is
-deliberate rather than overlooking that the GitHub issue is closed.
+Only then remove #52 from `README.md`. The tests now pass, but the row remains
+because this run did not perform repeated real client closes.
+
+## Local validation record
+
+On 2026-10-07, this checkout passed both required repository commands:
+
+```text
+cargo build --release   -> exit 0
+cargo test --workspace  -> exit 0
+```
+
+The host did not have the libadwaita, Boost, or Vulkan development packages
+installed system-wide. The run used an unpacked dependency overlay under
+`/tmp/cordial-build-deps` and pointed `PKG_CONFIG_PATH`, `BOOST_ROOT`,
+`CMAKE_PREFIX_PATH`, `LIBRARY_PATH`, `LD_LIBRARY_PATH`, and
+`CORDIAL_VK_INCLUDE` at it. Nothing was installed into the host or committed
+to the checkout.
+
+The first sandboxed workspace run reached the test suite but Unix-socket
+creation was denied for three Discord Presence tests. All 15 Presence tests
+passed outside that restriction. With the Vulkan include directory supplied,
+the Android OpenXR layout gate also passed, and the final unrestricted
+workspace run completed successfully. Tests explicitly requiring a real GTK
+display, compositor, GPU, audio server, game build, or network remained
+ignored by their existing annotations; therefore they are not evidence for
+the compositor- and hardware-dependent acceptance rows above.
