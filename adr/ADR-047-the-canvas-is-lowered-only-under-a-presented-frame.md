@@ -121,3 +121,18 @@ here, and was not tested against a compositor that withholds feedback. That
 cairo is needed when the only Vulkan device is a CPU renderer is a choice made
 on the brief and not measured: the GL conflict was only reproduced with the
 engine on GLES.
+
+## Fullscreen regression arm (2026-10-05)
+
+`tools/text-input-e2e.py` now drives the live `fullscreen`/`windowed` devctl
+verbs while a real TextBox remains focused. It verifies that the sway toplevel
+is exactly the nested output size, the editor is still placed from engine
+geometry, typing still changes the mirrored text, and presents advance both in
+fullscreen and after leaving it. It saves both a compositor capture (which can
+see the GTK editor) and a swapchain capture (which proves what the engine kept
+presenting).
+
+The harness has an explicit `--gtk-renderer vulkan|cairo` arm. The #53 matrix is
+therefore the same binary and scenario twice, once per renderer; `auto` remains
+available to validate the probe's real choice. These are reproducible commands,
+not a claim that Hyprland or the reporter's GPU has passed them.
